@@ -1,0 +1,314 @@
+import eventlet
+eventlet.monkey_patch()
+import os
+from flask import Flask, render_template, request, jsonify
+import json
+from flask_sqlalchemy import SQLAlchemy
+from flask_socketio import SocketIO, emit, join_room, leave_room
+
+# Initialize Flask app
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{os.path.join(os.path.dirname(__file__), "chat.db")}'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize extensions
+db = SQLAlchemy(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# Database Models
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+
+class Group(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), unique=True, nullable=False)
+    members = db.relationship('User', secondary='group_members')
+
+# Association table for group members
+group_members = db.Table('group_members',
+    db.Column('user_id', db.Integer, db.ForeignKey('user.id')),
+    db.Column('group_id', db.Integer, db.ForeignKey('group.id'))
+)
+
+class Message(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    sender = db.Column(db.String(80))
+    recipient = db.Column(db.String(80))
+    group = db.Column(db.String(100))
+    content = db.Column(db.Text)
+    timestamp = db.Column(db.DateTime, default=db.func.now())
+
+# Initialize database
+with app.app_context():
+    db.create_all()
+
+# Global state
+connected_users = {}  # { username: sid }
+
+# Socket.IO Events
+@socketio.on('connect')
+def handle_connect():
+    print("Client connected")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    for user in list(connected_users):
+        if connected_users.get(user) == request.sid:
+            print(f"User {user} disconnected (SID: {request.sid})")
+            del connected_users[user]
+            emit('user_list', list(connected_users.keys()), broadcast=True)
+            break
+
+@socketio.on('register_user')
+def handle_register(data):
+    username = data.get('username')
+    if username:
+        user = User.query.filter_by(username=username).first()
+        if not user:
+            user = User(username=username)
+            db.session.add(user)
+            db.session.commit()
+        connected_users[username] = request.sid
+        emit('user_list', list(connected_users.keys()), broadcast=True)
+        print(f"User {username} connected (SID: {request.sid}). Current users: {list(connected_users.keys())}")
+
+@socketio.on('create_group')
+def handle_create_group(data):
+    group_name = data.get('groupName')
+    members_usernames = data.get('members', [])
+    if group_name:
+        existing_group = Group.query.filter_by(name=group_name).first()
+        if existing_group:
+            print(f"Group '{group_name}' already exists.")
+            emit('group_creation_error', {'message': f"Group '{group_name}' already exists."}, room=request.sid)
+            return
+        
+        group = Group(name=group_name)
+        db.session.add(group)
+        
+        for member_username in members_usernames:
+            user = User.query.filter_by(username=member_username).first()
+            if user:
+                group.members.append(user)
+            else:
+                print(f"Warning: User '{member_username}' not found when creating group '{group_name}'.")
+        
+        db.session.commit()
+        print(f"Group '{group_name}' created with members: {members_usernames}.")
+        
+        all_group_members = [m.username for m in group.members]
+        for member_username in all_group_members:
+            if member_username in connected_users:
+                join_room(group_name, sid=connected_users[member_username])
+                print(f"User '{member_username}' joined SocketIO room '{group_name}'.")
+        
+        emit('group_created', {'group': group_name, 'members': all_group_members}, broadcast=True)
+    else:
+        print("Error: Group name not provided for creation.")
+        emit('group_creation_error', {'message': "Group name cannot be empty."}, room=request.sid)
+
+@socketio.on('join_group')
+def handle_join_group(data):
+    group_name = data.get('group')
+    username = data.get('user')
+    
+    if group_name and username:
+        group_obj = Group.query.filter_by(name=group_name).first()
+        user_obj = User.query.filter_by(username=username).first()
+        
+        if not group_obj:
+            print(f"Error: Group '{group_name}' not found for user '{username}' to join.")
+            emit('join_group_error', {'message': f"Group '{group_name}' not found."}, room=request.sid)
+            return
+        
+        if not user_obj:
+            print(f"Error: User '{username}' not found, cannot join group '{group_name}'.")
+            emit('join_group_error', {'message': f"User '{username}' not found."}, room=request.sid)
+            return
+        
+        if user_obj not in group_obj.members:
+            group_obj.members.append(user_obj)
+            db.session.commit()
+        
+        if username in connected_users:
+            join_room(group_name, sid=connected_users[username])
+            print(f"User '{username}' joined SocketIO room '{group_name}'.")
+            emit('user_joined_group', {'group': group_name, 'user': username}, room=group_name)
+            emit('joined_group_success', {'group': group_name}, room=request.sid)
+        else:
+            print(f"User '{username}' not currently connected, added to group members but not SocketIO room.")
+    else:
+        print("Error: Group name or user not provided for joining group.")
+        emit('join_group_error', {'message': "Group name and user are required."}, room=request.sid)
+
+@socketio.on('send_message')
+def handle_message(data):
+    sender = data.get('sender')
+    recipient = data.get('recipient')
+    message_content = data.get('message')
+    message_id = data.get('id')
+    
+    if not all([sender, recipient, message_content, message_id]):
+        print("Error: Missing sender, recipient, message content, or message_id for direct message.")
+        return
+    
+    msg = Message(sender=sender, recipient=recipient, content=message_content)
+    db.session.add(msg)
+    db.session.commit()
+    
+    if recipient in connected_users:
+        emit('receive_message', {
+            'id': message_id,
+            'sender': sender,
+            'message': message_content,
+            'encrypted': data.get('encrypted', False)
+        }, room=connected_users[recipient])
+        
+        emit('message_delivered', {'id': message_id}, room=request.sid)
+        print(f"Message (ID: {message_id}) relayed to recipient '{recipient}'.")
+    else:
+        print(f"Recipient '{recipient}' not connected for message ID '{message_id}'.")
+
+@socketio.on('send_group_message')
+def handle_group_message(data):
+    group_name = data.get('group')
+    sender = data.get('sender')
+    message_content = data.get('message')
+    
+    if not all([group_name, sender, message_content]):
+        print("Error: Missing group, sender, or message content for group message.")
+        return
+    
+    group_obj = Group.query.filter_by(name=group_name).first()
+    if not group_obj:
+        print(f"Error: Group '{group_name}' not found for sending message.")
+        return
+    
+    msg = Message(sender=sender, group=group_name, content=message_content)
+    db.session.add(msg)
+    db.session.commit()
+    
+    emit('receive_group_message', {
+        'id': data.get('id'),
+        'sender': sender,
+        'message': message_content,
+        'group': group_name,
+        'encrypted': data.get('encrypted', False)
+    }, room=group_name)
+    print(f"Message relayed to group '{group_name}'.")
+    
+    emit('group_message_received', {
+        'id': data.get('id'),
+        'sender': sender,
+        'group': group_name
+    }, broadcast=True)
+
+@socketio.on('mark_message_read')
+def handle_mark_read(data):
+    message_id = data.get('messageId')
+    reader = data.get('reader')
+    original_sender = data.get('originalSender')
+    group_name = data.get('group')
+    
+    if not all([message_id, reader, original_sender]):
+        print(f"Error: Missing data for mark_message_read: {data}")
+        return
+    
+    print(f"User '{reader}' marked message ID '{message_id}' from sender '{original_sender}' as read.")
+    
+    if original_sender in connected_users:
+        emit('message_read_by_recipient', {
+            'id': message_id,
+            'reader': reader
+        }, room=connected_users[original_sender])
+
+@socketio.on('send_voice_message')
+def handle_voice_message(data):
+    sender = data.get('sender')
+    recipient = data.get('recipient')
+    audio_data = data.get('audioData')
+    message_id = data.get('id')
+    message_type = data.get('type', 'voice')
+    
+    if not all([sender, recipient, audio_data, message_id, message_type == 'voice']):
+        print(f"Error: Missing data for send_voice_message: {data}")
+        return
+    
+    print(f"Voice message from '{sender}' to '{recipient}' (ID: {message_id}).")
+    emit('receive_message', {
+        'id': message_id,
+        'sender': sender,
+        'type': message_type,
+        'audioData': audio_data
+    }, room=connected_users.get(recipient))
+    
+    emit('message_delivered', {'id': message_id}, room=connected_users.get(sender))
+
+@socketio.on('send_group_voice_message')
+def handle_group_voice_message(data):
+    sender = data.get('sender')
+    group_name = data.get('group')
+    audio_data = data.get('audioData')
+    message_id = data.get('id')
+    message_type = data.get('type', 'voice')
+    
+    if not all([sender, group_name, audio_data, message_id, message_type == 'voice']):
+        print(f"Error: Missing data for send_group_voice_message: {data}")
+        return
+    
+    print(f"Voice message from '{sender}' to group '{group_name}' (ID: {message_id}).")
+    emit('receive_group_message', {
+        'id': message_id,
+        'sender': sender,
+        'type': message_type,
+        'audioData': audio_data,
+        'group': group_name
+    }, room=group_name)
+    print(f"Voice message (ID: {message_id}) relayed to group '{group_name}'.")
+
+@socketio.on('call_user')
+def handle_call(data):
+    callee = data.get('callee')
+    caller = data.get('caller')
+    offer = data.get('offer')
+    
+    if callee in connected_users:
+        print(f"Relaying call offer from '{caller}' to '{callee}'.")
+        emit('incoming_call', {
+            'caller': caller,
+            'offer': offer
+        }, room=connected_users[callee])
+    else:
+        print(f"Callee '{callee}' not connected for call from '{caller}'.")
+
+@socketio.on('accept_call')
+def handle_accept(data):
+    caller = data.get('caller')
+    answer = data.get('answer')
+    
+    if caller in connected_users:
+        print(f"Relaying call acceptance to '{caller}'.")
+        emit('call_accepted', {
+            'answer': answer
+        }, room=connected_users[caller])
+    else:
+        print(f"Caller '{caller}' not connected to relay call acceptance.")
+
+@socketio.on('ice_candidate')
+def handle_ice(data):
+    target = data.get('target')
+    candidate = data.get('candidate')
+    
+    if target in connected_users:
+        emit('relay_ice', {
+            'candidate': candidate
+        }, room=connected_users[target])
+    else:
+        print(f"Target '{target}' for ICE candidate not connected.")
+
+# Start server
+if __name__ == '__main__':
+    print(f"Attempting to start server on http://0.0.0.0:5000")
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False)
